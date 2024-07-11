@@ -1,0 +1,15 @@
+[package]
+name = "bittorrent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bendy = { version = "^0.3", features = ["std", "serde"] }
+hex = "0.4.3"
+rand = "0.8.5"
+reqwest = "0.12.5"
+serde = { version = "1.0", features = ["derive"] }
+sha1 = "0.10.6"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2.5.2"
+urlencoding = "2.1.3"
