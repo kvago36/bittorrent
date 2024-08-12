@@ -1,16 +1,40 @@
-use std::{fs::{self, File}, io::{self, Read}};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::mem;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::{
+    fs::{self, File},
+    io::{self, Cursor, Read, Write},
+};
 
-use tokio::runtime::Runtime;
-use url::Url;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::time::Duration;
+
+use crossbeam::channel::unbounded;
+
+use std::sync::{Arc, Mutex};
+
 use rand::prelude::*;
+use sha1::{Digest, Sha1};
+use url::Url;
 use urlencoding::encode_binary;
-use sha1::{Sha1, Digest};
 
-use bendy::decoding::{Decoder, Object};
+// use bendy::decoding::{Decoder, Object};
 use serde::{Deserialize, Serialize};
+use serde_bencode;
 
-pub use hashes::Hashes;
+mod handshake;
+mod hashes;
+mod message;
+mod peer;
+mod peers;
+mod piece;
+
+use handshake::Handshake;
+use hashes::Hashes;
+use message::{Message, MessageID, Request, BLOCK_MAX};
+use peer::PeerConnection;
+use peers::Peers;
 
 pub fn urlencode(t: &[u8; 20]) -> String {
     let mut encoded = String::with_capacity(3 * t.len());
@@ -34,21 +58,35 @@ pub fn info_hash(info: &Info) -> [u8; 20] {
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct BencodeInfo<'a> {
-    pieces: &'a [u8], 
+    pieces: &'a [u8],
     #[serde(rename = "piece length")]
-    piece_length: i64,  
+    piece_length: i64,
     length: i64,
-    // files: Option<Vec<BencodeFiles>>,    
-    name: String, 
+    // files: Option<Vec<BencodeFiles>>,
+    name: String,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct BencodeFiles {
     length: usize,
-    path: String
+    path: String,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Clone, Deserialize, Debug)]
+struct PeersInfo {
+    #[serde(serialize_with = "ordered_map")]
+    peers: Peers,
+    interval: usize,
+}
+
+// #[derive(Serialize, Deserialize, Debug)]
+// struct Peer {
+//     id: Option<String>,
+//     ip: IpAddr,
+//     port: i64,
+// }
+
+#[derive(Serialize, Deserialize, Debug)]
 struct BencodeTorrent<'a> {
     announce: String,
     #[serde(borrow)]
@@ -64,12 +102,12 @@ pub struct Torrent {
     pub info: Info,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct SendInfo {
-    info_hash:  String,
+    info_hash: String,
     peer_id: String,
     port: SocketAddr,
-    uploaded:  String,
+    uploaded: String,
     downloaded: String,
     compact: String,
     left: String,
@@ -110,117 +148,219 @@ pub enum Keys {
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut f = File::open("sample.torrent")?;
     let mut buffer = Vec::new();
 
     f.read_to_end(&mut buffer)?;
 
-    let deserialized = bendy::serde::from_bytes::<Torrent>(&buffer).unwrap();
+    let deserialized = serde_bencode::from_bytes::<Torrent>(&buffer).unwrap();
 
-    let rt  = Runtime::new()?;
+    // rt.block_on(async {
+    let mut url = Url::parse(&deserialized.announce).unwrap();
 
-    rt.block_on(async {
-        let mut url = Url::parse(&deserialized.announce).unwrap();
+    // for hash in &deserialized.info.pieces.0 {
+    //     println!("{}", hex::encode(&hash));
+    // }
 
-        for hash in &deserialized.info.pieces.0 {
-            println!("{}", hex::encode(&hash));
-        }
+    let mut data = [0u8; 20];
+    rand::thread_rng().fill_bytes(&mut data);
 
-        let mut data = [0u8; 20];
-        rand::thread_rng().fill_bytes(&mut data);
+    let info = serde_bencode::to_bytes(&deserialized.info).unwrap();
 
-        let info = bendy::serde::to_bytes(&deserialized.info).unwrap();
+    let mut hasher = Sha1::new();
 
-        let mut hasher = Sha1::new();
+    hasher.update(info);
 
-        hasher.update(info);
+    let result = info_hash(&deserialized.info);
+    let urlencoded = urlencode(&result);
 
-        let result = info_hash(&deserialized.info);
-        let urlencoded = urlencode(&result);
+    let coded = encode_binary(&data);
 
-        let coded = encode_binary(&data);
+    let query_string = format!("info_hash={}&peer_id={}", urlencoded, coded);
 
-        let query_string = format!("info_hash={}&peer_id={}", urlencoded, coded);
-        
-        url.set_query(Some(&query_string));
+    url.set_query(Some(&query_string));
 
-        url.query_pairs_mut().append_pair("port", "6881");
-        url.query_pairs_mut().append_pair("uploaded", "0");
-        url.query_pairs_mut().append_pair("downloaded", "0");
-        url.query_pairs_mut().append_pair("compact", "1");
+    url.query_pairs_mut().append_pair("port", "6881");
+    url.query_pairs_mut().append_pair("uploaded", "0");
+    url.query_pairs_mut().append_pair("downloaded", "0");
+    url.query_pairs_mut().append_pair("compact", "1");
 
-        // println!("{}", url.to_string());
+    // println!("{}", url.to_string());
 
-        let length = if let Keys::SingleFile { length } = deserialized.info.keys {
-            length
-        } else {
-            todo!()
-        };
+    let length = if let Keys::SingleFile { length } = deserialized.info.keys {
+        length
+    } else {
+        todo!()
+    };
 
-        url.query_pairs_mut().append_pair("left", &length.to_string());
-        // deserialized.info
+    url.query_pairs_mut()
+        .append_pair("left", &length.to_string());
+    // deserialized.info
 
-        let body = reqwest::get(url)
-            .await.unwrap()
-            .text()
-            .await.unwrap();
+    let body = reqwest::get(url).await.unwrap().bytes().await.unwrap();
 
-        println!("body = {body:?}");
-    });
+    // println!("body = {body:?}");
+
+    let peers_info = serde_bencode::from_bytes::<PeersInfo>(&body).unwrap();
+
+    println!("{:?}", peers_info);
+
+    let mut handles = Vec::new();
+
+    // let (tx_res, mut rx_res) = mpsc::channel(32);
+    // let (tx_req, rx_req) = unbounded();
+
+    let mut foo = false;
+
+    // for peer in peers_info.peers.0.into_iter() {
+        // if foo == true {
+        //     continue;
+        // }
+
+        // foo = true;
+        // let ss = tx_res.clone();
+        // let rr = rx_req.clone();
+
+        // let pp = Peer::new(host_ip, stream);
+
+        let test = SocketAddrV4::new(Ipv4Addr::new(178, 62, 85, 20), 51489);
+
+        handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(test).await.unwrap();
+            let mut handshake = Handshake::new(result, data);
+
+            {
+                let handshake_bytes =
+                    &mut handshake as *mut Handshake as *mut [u8; std::mem::size_of::<Handshake>()];
+                // Safety: Handshake is a POD with repr(c) and repr(packed)
+                let handshake_bytes: &mut [u8; std::mem::size_of::<Handshake>()] =
+                    unsafe { &mut *handshake_bytes };
+                // println!("{:?}", handshake_bytes);
+                stream.write_all(handshake_bytes).await.unwrap();
+                stream.read_exact(handshake_bytes).await.unwrap();
+                println!("send handshake to {}", test);
+            }
+
+            let mut pc = PeerConnection::new(stream);
+            pc.read_frame().await.unwrap();
+
+            let interested_message = Message::new(MessageID::MsgInterested, vec![]);
+            pc.write_frame(interested_message).await.unwrap();
+
+            loop {
+                // let message = pc.read_frame().await.unwrap();
+
+                if let Some(frame) = pc.read_frame().await.unwrap() {
+                    match frame.id {
+                        MessageID::MsgUnchoke => {
+                            // let mut request = Request::new(0, 0, 16 * 1024);
+
+                            let mut request = Request::new(
+                                0 as u32,
+                                (0 * BLOCK_MAX) as u32,
+                                BLOCK_MAX as u32,
+                            );
+
+                            let reqwest_bytes = Vec::from(request.as_bytes_mut());
+
+                            let request_message = Message::new(MessageID::MsgRequest, reqwest_bytes);
+
+                            pc.write_frame(request_message).await.unwrap();
+                            println!("send request message")
+                        },
+                        MessageID::MsgPiece => {
+                            println!("{:?}", frame)
+                        }
+                        n => !todo!()
+                    }
+                }
+            }
+            // loop {
+            //     stream.readable().await.unwrap();
+
+            //     // let ss = tx_res.clone();
+            //     let mut buf = [0; 4096];
+            //     // stream.read_u32();
+            //     // Set a timeout for the read operation
+
+            //     match stream.try_read(&mut buf) {
+            //         Ok(n) => {
+            //             if n < 4 {
+            //                 print!("not enough data");
+            //                 continue;
+            //             }
+
+            //             let mut length_bytes = [0u8; 4];
+
+            //             length_bytes.copy_from_slice(&buf[..4]);
+            //             let length = u32::from_be_bytes(length_bytes) as usize;
+            //             let tag_id = &buf[4];
+            //             if length == 0 {
+            //                 println!("Ping from client");
+            //                 continue;
+            //             }
+
+            //             println!("read {} bytes", n);
+            //             println!("length {}", length);
+            //             println!("tag {}", tag_id);
+            //             println!("payload {:?}", &buf[5..n].to_vec());
+
+            //             let message_id = match tag_id {
+            //                 0 => MessageID::MsgChoke,
+            //                 1 => MessageID::MsgUnchoke,
+            //                 2 => MessageID::MsgInterested,
+            //                 3 => MessageID::MsgNotInterested,
+            //                 4 => MessageID::MsgHave,
+            //                 5 => MessageID::MsgBitfield,
+            //                 6 => MessageID::MsgRequest,
+            //                 7 => MessageID::MsgPiece,
+            //                 8 => MessageID::MsgCancel,
+            //                 message_id => {
+            //                     break;
+            //                     // return Err(std::io::Error::new(
+            //                     //     std::io::ErrorKind::InvalidData,
+            //                     //     format!("Unknown message type {}.", message_id),
+            //                     // ))
+            //                 }
+            //             };
+
+            //             let msg = Message::new(message_id, buf[5..n].to_vec());
+            //             // ss.send(msg).await.unwrap();
+            //             // foo.push(msg);
+            //             // let income = rr.recv_timeout(Duration::from_secs(1)).unwrap();
+            //         }
+            //         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            //             continue;
+            //         }
+            //         Err(e) => {
+            //             println!("{:?}", e);
+            //             break;
+            //         }
+            //     }
+            // }
+
+            // println!("{:?}", foo)
+        }));
+    // }
+
+    // while let Some(message) = rx_res.recv().await {
+    //     println!("GOT = {:?}", message);
+    //     match message.id {
+    //         MessageID::MsgBitfield => {
+    //             tx_req.send(2).unwrap();
+    //         }
+    //         n => {
+    //             !todo!();
+    //         }
+    //     }
+    // }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+    // });
 
     Ok(())
-}
-
-
-mod hashes {
-    use serde::de::{self, Deserialize, Deserializer, Visitor};
-    use serde::ser::{Serialize, Serializer};
-    use std::fmt;
-
-    #[derive(Debug, Clone)]
-    pub struct Hashes(pub Vec<[u8; 20]>);
-    struct HashesVisitor;
-
-    impl<'de> Visitor<'de> for HashesVisitor {
-        type Value = Hashes;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a byte string whose length is a multiple of 20")
-        }
-
-        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            if v.len() % 20 != 0 {
-                return Err(E::custom(format!("length is {}", v.len())));
-            }
-            // TODO: use array_chunks when stable
-            Ok(Hashes(
-                v.chunks_exact(20)
-                    .map(|slice_20| slice_20.try_into().expect("guaranteed to be length 20"))
-                    .collect(),
-            ))
-        }
-    }
-
-    impl<'de> Deserialize<'de> for Hashes {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            deserializer.deserialize_bytes(HashesVisitor)
-        }
-    }
-
-    impl Serialize for Hashes {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            let single_slice = self.0.concat();
-            serializer.serialize_bytes(&single_slice)
-        }
-    }
 }

@@ -5,11 +5,15 @@ edition = "2021"
 
 [dependencies]
 bendy = { version = "^0.3", features = ["std", "serde"] }
+bytes = "1.7.1"
+crossbeam = "0.8.4"
 hex = "0.4.3"
 rand = "0.8.5"
 reqwest = "0.12.5"
 serde = { version = "1.0", features = ["derive"] }
+serde_bencode = "0.2.3"
 sha1 = "0.10.6"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1.39.2", features = ["full"] }
+tokio-macros = "=2.4.0"
 url = "2.5.2"
 urlencoding = "2.1.3"
