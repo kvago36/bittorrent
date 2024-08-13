@@ -9,6 +9,7 @@ use tokio::{
 use std::io::Cursor;
 
 use crate::{
+    bitfield::Bitfield,
     message::{self, Message, MessageID},
 };
 
@@ -20,6 +21,7 @@ use crate::{
 pub struct PeerConnection {
     stream: BufWriter<TcpStream>,
     buffer: BytesMut,
+    bitfield: Bitfield,
     choked: bool,
 }
 
@@ -28,6 +30,7 @@ impl PeerConnection {
         PeerConnection {
             stream: BufWriter::new(stream),
             choked: true,
+            bitfield: Bitfield::from_payload(Vec::new()),
             buffer: BytesMut::with_capacity(4096),
         }
         // !todo!();
@@ -36,6 +39,10 @@ impl PeerConnection {
     pub async fn read_frame(&mut self) -> Result<Option<Message>> {
         loop {
             if let Some(frame) = self.parse_frame()? {
+                if frame.id == MessageID::MsgBitfield {
+                    self.bitfield = Bitfield::from_payload(frame.payload.clone());
+                }
+
                 if frame.id == MessageID::MsgUnchoke {
                     self.choked = false;
                 }

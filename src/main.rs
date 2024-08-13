@@ -29,6 +29,7 @@ mod message;
 mod peer;
 mod peers;
 mod piece;
+mod bitfield;
 
 use handshake::Handshake;
 use hashes::Hashes;
@@ -212,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let (tx_res, mut rx_res) = mpsc::channel(32);
     // let (tx_req, rx_req) = unbounded();
 
-    let mut foo = false;
+    // let mut foo = false;
 
     // for peer in peers_info.peers.0.into_iter() {
         // if foo == true {
@@ -244,16 +245,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut pc = PeerConnection::new(stream);
-            pc.read_frame().await.unwrap();
+            // pc.read_frame().await.unwrap();
 
-            let interested_message = Message::new(MessageID::MsgInterested, vec![]);
-            pc.write_frame(interested_message).await.unwrap();
+            // let interested_message = Message::new(MessageID::MsgInterested, vec![]);
+            // pc.write_frame(interested_message).await.unwrap();
 
             loop {
                 // let message = pc.read_frame().await.unwrap();
 
                 if let Some(frame) = pc.read_frame().await.unwrap() {
                     match frame.id {
+                        MessageID::MsgBitfield => {
+                            let interested_message = Message::new(MessageID::MsgInterested, vec![]);
+                            pc.write_frame(interested_message).await.unwrap();
+                        }
                         MessageID::MsgUnchoke => {
                             // let mut request = Request::new(0, 0, 16 * 1024);
 
