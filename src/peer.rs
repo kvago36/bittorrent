@@ -31,7 +31,7 @@ impl PeerConnection {
             stream: BufWriter::new(stream),
             choked: true,
             bitfield: Bitfield::from_payload(Vec::new()),
-            buffer: BytesMut::with_capacity(4096),
+            buffer: BytesMut::with_capacity(4 * 1024),
         }
         // !todo!();
     }
@@ -43,17 +43,48 @@ impl PeerConnection {
                     self.bitfield = Bitfield::from_payload(frame.payload.clone());
                 }
 
+                // println!("{:?}", frame.id);
+
+                if frame.id == MessageID::MsgPiece {
+                    // 'inner: loop {
+                    //     let n = self.stream.read_buf(&mut self.buffer).await?;
+
+                    //     println!("{}", n);
+
+                    //     if n != 0 {
+                    //         println!("merge {} bytes", n);
+
+                    //         let mut combined_vec = Vec::new();
+
+                    //         combined_vec.extend(&frame.payload);
+                    //         combined_vec.extend(&self.buffer[0..n]);
+
+                    //         frame.payload = combined_vec
+                    //     } else {
+                    //         // empty buffer
+                    //         println!("break");
+                    //         break 'inner;
+                    //     }
+                    // }
+                    // println!("piece message {}", self.buffer.len());
+                }
+
                 if frame.id == MessageID::MsgUnchoke {
                     self.choked = false;
                 }
                 
-                println!("{:?}", frame);
+                println!("{:?} len: {:?}", frame.id, frame.payload.len());
                 return Ok(Some(frame));
             }
 
             let n = self.stream.read_buf(&mut self.buffer).await?;
 
-            println!("{}", n);
+            println!("n size: {}", n);
+
+            // if self.buffer.len() == self.buffer.capacity() {
+            //     println!("grow {}, capacity {}", self.buffer.len(), self.buffer.capacity());
+            //     self.buffer.resize(self.buffer.capacity() * 2, 0);
+            // }
 
             // There is not enough buffered data to read a frame. Attempt to
             // read more data from the socket.
@@ -104,7 +135,23 @@ impl PeerConnection {
                 // Return the frame to the caller.
                 Ok(frame)
             }
-            Err(_) => Ok(None),
+            Err(error) => {
+                if let message::ParsingError::Incomplete(n) = error {
+                    self.buffer.reserve(n);
+                }
+
+                Ok(None)
+                // match error {
+                //     message::ParsingError::Incomplete(n) => {
+                //         self.buffer.reserve(n);
+                //         Ok(None)
+                //     },
+                //     message::ParsingError::Other(_) => {
+                //         Ok(None)
+                //     }
+                // }
+            },
+            // Err(_) => Ok(None),
         }
     }
 }

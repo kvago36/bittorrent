@@ -1,5 +1,6 @@
-use bytes::Buf;
-use std::io::{Cursor, Read};
+use bytes::{Buf, BytesMut};
+// use core::{error, fmt};
+use std::io::{Cursor, Error, Read};
 
 // use tokio::io::Result;
 
@@ -8,6 +9,23 @@ pub struct Message {
     pub id: MessageID,
     pub payload: Vec<u8>,
 }
+
+#[derive(Debug)]
+pub enum ParsingError {
+    /// Not enough data is available to parse a message
+    Incomplete(usize),
+
+    /// Invalid message encoding
+    Other(std::io::Error),
+}
+
+// impl fmt::Display for ParsingError {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         write!(f, "{:?}", self)
+//     }
+// }
+
+// impl error::Error for ParsingError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -53,10 +71,10 @@ impl Message {
         Ok(message)
     }
 
-    pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Message>, tokio::io::Error> {        
+    pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Message>, ParsingError> {        
         // Read length marker.
-        if !src.has_remaining() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "empty buffer"));
+        if src.get_ref().len() < 4 {
+            return Ok(None);
         }
 
         let mut length_bytes = [0u8; 4];
@@ -67,13 +85,27 @@ impl Message {
 
         let length = u32::from_be_bytes(length_bytes) as usize;
 
-        // if length == 0 {
-        //     // this is a heartbeat message.
-        //     // discard it.
-        //     src.advance(4);
-        //     // and then try again in case the buffer has more messages
-        //     return self.parse(src);
-        // }
+        println!("length: {}", length);
+
+        if length == 0 {
+            // this is a heartbeat message.
+            // discard it.
+            src.advance(4);
+            // and then try again in case the buffer has more messages
+            return Ok(None);
+        }
+
+        if src.get_ref().len() < 4 + length {
+            // The full string has not yet arrived.
+            //
+            // We reserve more space in the buffer. This is not strictly
+            // necessary, but is a good idea performance-wise.
+            // buffer.reserve(4 + length - buffer.len());
+
+            // We inform the Framed that we need more bytes to form the next
+            // frame.
+            return Err(ParsingError::Incomplete(src.get_ref().len()));
+        }
 
         if !src.has_remaining() {
             // Not enough data to read tag marker.
@@ -83,10 +115,14 @@ impl Message {
         // Check that the length is not too large to avoid a denial of
         // service attack where the server runs out of memory.
         if length > MAX {
-            return Err(std::io::Error::new(
+            return Err(ParsingError::Other(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Frame of length {} is too large.", length),
-            ));
+            )));
+            // return Err(std::io::Error::new(
+            //     std::io::ErrorKind::InvalidData,
+            //     format!("Frame of length {} is too large.", length),
+            // ));
         }
 
         let tag = src.get_u8();
@@ -102,17 +138,21 @@ impl Message {
             7 => MessageID::MsgPiece,
             8 => MessageID::MsgCancel,
             message_id => {
-                return Err(std::io::Error::new(
+                return Err(ParsingError::Other(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("Unknown message type {}.", message_id),
-                ))
+                )));
+                // return Err(std::io::Error::new(
+                //     std::io::ErrorKind::InvalidData,
+                //     format!("Unknown message type {}.", message_id),
+                // ))
             }
         };
 
         let mut data = Vec::new();
 
         // read the whole file
-        src.read_to_end(&mut data)?;
+        src.read_to_end(&mut data).unwrap();
 
         Ok(Some(Message::new(message_id, data)))
     }

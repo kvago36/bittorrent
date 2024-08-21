@@ -1,13 +1,14 @@
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::{
-    fs::{self, File},
     io::{self, Cursor, Read, Write},
 };
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use piece::{Block, Piece, BlockInfo};
+use tokio::io::{SeekFrom, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::fs::File;
 use tokio::time::Duration;
 
 use crossbeam::channel::unbounded;
@@ -57,21 +58,31 @@ pub fn info_hash(info: &Info) -> [u8; 20] {
         .expect("GenericArray<_, 20> == [_; 20]")
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
-struct BencodeInfo<'a> {
-    pieces: &'a [u8],
-    #[serde(rename = "piece length")]
-    piece_length: i64,
-    length: i64,
-    // files: Option<Vec<BencodeFiles>>,
-    name: String,
+const PIECE_SIZE: usize = 1 << 14; // 2^14 = 16384 bytes (16 KB)
+
+async fn write_piece(file: &mut File, piece: &Block) -> io::Result<()> {
+    // Рассчитываем смещение, куда нужно записать данную часть
+    // let offset = (piece.index() * PIECE_SIZE) as u64;
+    file.seek(SeekFrom::Start(0)).await?;
+    file.write_all(&*piece.data).await?;
+    Ok(())
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct BencodeFiles {
-    length: usize,
-    path: String,
-}
+// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+// struct BencodeInfo<'a> {
+//     pieces: &'a [u8],
+//     #[serde(rename = "piece length")]
+//     piece_length: i64,
+//     length: i64,
+//     // files: Option<Vec<BencodeFiles>>,
+//     name: String,
+// }
+
+// #[derive(Serialize, Deserialize, Debug)]
+// struct BencodeFiles {
+//     length: usize,
+//     path: String,
+// }
 
 #[derive(Clone, Deserialize, Debug)]
 struct PeersInfo {
@@ -87,13 +98,13 @@ struct PeersInfo {
 //     port: i64,
 // }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct BencodeTorrent<'a> {
-    announce: String,
-    #[serde(borrow)]
-    info: BencodeInfo<'a>,
-    // comment: String,
-}
+// #[derive(Serialize, Deserialize, Debug)]
+// struct BencodeTorrent<'a> {
+//     announce: String,
+//     #[serde(borrow)]
+//     info: BencodeInfo<'a>,
+//     // comment: String,
+// }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Torrent {
@@ -151,10 +162,11 @@ pub enum Keys {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut f = File::open("sample.torrent")?;
+    let mut f = File::open("sample.torrent").await?;
+    let mut o = File::create("foo.txt").await?;
     let mut buffer = Vec::new();
 
-    f.read_to_end(&mut buffer)?;
+    f.read_to_end(&mut buffer).await?;
 
     let deserialized = serde_bencode::from_bytes::<Torrent>(&buffer).unwrap();
 
@@ -176,6 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = info_hash(&deserialized.info);
     let urlencoded = urlencode(&result);
+
+    println!("pieces_len: {:?}, psize: {:?} length: {:?}", deserialized.info.pieces.0.len(), deserialized.info.plength, deserialized.info.keys);
 
     let coded = encode_binary(&data);
 
@@ -206,11 +220,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peers_info = serde_bencode::from_bytes::<PeersInfo>(&body).unwrap();
 
-    println!("{:?}", peers_info);
+    // println!("{:?}", peers_info);
 
     let mut handles = Vec::new();
 
-    // let (tx_res, mut rx_res) = mpsc::channel(32);
+    let (tx_res, mut rx_res) = mpsc::channel(32);
     // let (tx_req, rx_req) = unbounded();
 
     // let mut foo = false;
@@ -225,8 +239,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // let rr = rx_req.clone();
 
         // let pp = Peer::new(host_ip, stream);
-
-        let test = SocketAddrV4::new(Ipv4Addr::new(178, 62, 85, 20), 51489);
+        let test = peers_info.peers.0[0];
+        // let test = SocketAddrV4::new(Ipv4Addr::new(178, 62, 85, 20), 51489);
 
         handles.push(tokio::spawn(async move {
             let mut stream = TcpStream::connect(test).await.unwrap();
@@ -262,105 +276,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         MessageID::MsgUnchoke => {
                             // let mut request = Request::new(0, 0, 16 * 1024);
 
+                            // pc.get_bitfield();
+
                             let mut request = Request::new(
                                 0 as u32,
                                 (0 * BLOCK_MAX) as u32,
                                 BLOCK_MAX as u32,
                             );
 
-                            let reqwest_bytes = Vec::from(request.as_bytes_mut());
+                            let request_bytes = Vec::from(request.as_bytes_mut());
 
-                            let request_message = Message::new(MessageID::MsgRequest, reqwest_bytes);
+                            let request_message = Message::new(MessageID::MsgRequest, request_bytes);
 
                             pc.write_frame(request_message).await.unwrap();
                             println!("send request message")
                         },
                         MessageID::MsgPiece => {
-                            println!("{:?}", frame)
-                        }
+                            let block_info = BlockInfo {
+                                piece_index: 0 as usize,
+                                offset: 0,
+                                len: frame.payload.len() as u32,
+                            };
+
+                            let block = Block::new(block_info, frame.payload);
+
+                            // let piece = Piece::new(&frame.payload);
+                            tx_res.send(block).await.unwrap();
+                            // println!("{:?}", frame.payload);
+                        },
                         n => !todo!()
                     }
                 }
             }
-            // loop {
-            //     stream.readable().await.unwrap();
-
-            //     // let ss = tx_res.clone();
-            //     let mut buf = [0; 4096];
-            //     // stream.read_u32();
-            //     // Set a timeout for the read operation
-
-            //     match stream.try_read(&mut buf) {
-            //         Ok(n) => {
-            //             if n < 4 {
-            //                 print!("not enough data");
-            //                 continue;
-            //             }
-
-            //             let mut length_bytes = [0u8; 4];
-
-            //             length_bytes.copy_from_slice(&buf[..4]);
-            //             let length = u32::from_be_bytes(length_bytes) as usize;
-            //             let tag_id = &buf[4];
-            //             if length == 0 {
-            //                 println!("Ping from client");
-            //                 continue;
-            //             }
-
-            //             println!("read {} bytes", n);
-            //             println!("length {}", length);
-            //             println!("tag {}", tag_id);
-            //             println!("payload {:?}", &buf[5..n].to_vec());
-
-            //             let message_id = match tag_id {
-            //                 0 => MessageID::MsgChoke,
-            //                 1 => MessageID::MsgUnchoke,
-            //                 2 => MessageID::MsgInterested,
-            //                 3 => MessageID::MsgNotInterested,
-            //                 4 => MessageID::MsgHave,
-            //                 5 => MessageID::MsgBitfield,
-            //                 6 => MessageID::MsgRequest,
-            //                 7 => MessageID::MsgPiece,
-            //                 8 => MessageID::MsgCancel,
-            //                 message_id => {
-            //                     break;
-            //                     // return Err(std::io::Error::new(
-            //                     //     std::io::ErrorKind::InvalidData,
-            //                     //     format!("Unknown message type {}.", message_id),
-            //                     // ))
-            //                 }
-            //             };
-
-            //             let msg = Message::new(message_id, buf[5..n].to_vec());
-            //             // ss.send(msg).await.unwrap();
-            //             // foo.push(msg);
-            //             // let income = rr.recv_timeout(Duration::from_secs(1)).unwrap();
-            //         }
-            //         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-            //             continue;
-            //         }
-            //         Err(e) => {
-            //             println!("{:?}", e);
-            //             break;
-            //         }
-            //     }
-            // }
-
-            // println!("{:?}", foo)
         }));
     // }
 
-    // while let Some(message) = rx_res.recv().await {
-    //     println!("GOT = {:?}", message);
-    //     match message.id {
-    //         MessageID::MsgBitfield => {
-    //             tx_req.send(2).unwrap();
-    //         }
-    //         n => {
-    //             !todo!();
-    //         }
-    //     }
-    // }
+    while let Some(piece) = rx_res.recv().await {
+        // write to file
+        println!("{}", piece.info());
+        write_piece(&mut o, &piece).await.unwrap();
+    }
 
     for handle in handles {
         handle.await.unwrap();
