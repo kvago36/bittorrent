@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-channel = "2.3.1"
 bendy = { version = "^0.3", features = ["std", "serde"] }
 bytes = "1.7.1"
 crossbeam = "0.8.4"

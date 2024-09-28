@@ -1,5 +1,3 @@
-use std::net::SocketAddrV4;
-
 use bytes::{Buf, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter, Result},
@@ -8,83 +6,29 @@ use tokio::{
 
 use std::io::Cursor;
 
-use crate::{
-    bitfield::Bitfield,
-    message::{self, Message, MessageID},
-};
-
-// trait Bytable {
-//     fn to_bytes(&self) -> Result<Vec<u8>, std::io::Error>;
-// }
+use crate::message::{Message, ParsingError};
 
 #[derive(Debug)]
 pub struct PeerConnection {
     stream: BufWriter<TcpStream>,
     buffer: BytesMut,
-    bitfield: Bitfield,
-    choked: bool,
 }
 
 impl PeerConnection {
     pub fn new(stream: TcpStream) -> Self {
         PeerConnection {
             stream: BufWriter::new(stream),
-            choked: true,
-            bitfield: Bitfield::from_payload(Vec::new()),
             buffer: BytesMut::with_capacity(4 * 1024),
         }
-        // !todo!();
     }
 
     pub async fn read_frame(&mut self) -> Result<Option<Message>> {
         loop {
             if let Some(frame) = self.parse_frame()? {
-                if frame.id == MessageID::MsgBitfield {
-                    self.bitfield = Bitfield::from_payload(frame.payload.clone());
-                }
-
-                // println!("{:?}", frame.id);
-
-                if frame.id == MessageID::MsgPiece {
-                    // 'inner: loop {
-                    //     let n = self.stream.read_buf(&mut self.buffer).await?;
-
-                    //     println!("{}", n);
-
-                    //     if n != 0 {
-                    //         println!("merge {} bytes", n);
-
-                    //         let mut combined_vec = Vec::new();
-
-                    //         combined_vec.extend(&frame.payload);
-                    //         combined_vec.extend(&self.buffer[0..n]);
-
-                    //         frame.payload = combined_vec
-                    //     } else {
-                    //         // empty buffer
-                    //         println!("break");
-                    //         break 'inner;
-                    //     }
-                    // }
-                    // println!("piece message {}", self.buffer.len());
-                }
-
-                if frame.id == MessageID::MsgUnchoke {
-                    self.choked = false;
-                }
-                
-                println!("{:?} len: {:?}", frame.id, frame.payload.len());
                 return Ok(Some(frame));
             }
 
             let n = self.stream.read_buf(&mut self.buffer).await?;
-
-            println!("n size: {}", n);
-
-            // if self.buffer.len() == self.buffer.capacity() {
-            //     println!("grow {}, capacity {}", self.buffer.len(), self.buffer.capacity());
-            //     self.buffer.resize(self.buffer.capacity() * 2, 0);
-            // }
 
             // There is not enough buffered data to read a frame. Attempt to
             // read more data from the socket.
@@ -108,11 +52,8 @@ impl PeerConnection {
         }
     }
 
-    pub async fn write_frame(&mut self, message: Message) -> Result<()> {
-        // implementation here
-        let data = message.to_bytes()?;
-
-        self.stream.write_all(&data).await?;
+    pub async fn write_frame(&mut self, bytes: &[u8]) -> Result<()> {
+        self.stream.write_all(&bytes).await?;
         self.stream.flush().await?;
 
         Ok(())
@@ -136,22 +77,12 @@ impl PeerConnection {
                 Ok(frame)
             }
             Err(error) => {
-                if let message::ParsingError::Incomplete(n) = error {
+                if let ParsingError::Incomplete(n) = error {
                     self.buffer.reserve(n);
                 }
 
                 Ok(None)
-                // match error {
-                //     message::ParsingError::Incomplete(n) => {
-                //         self.buffer.reserve(n);
-                //         Ok(None)
-                //     },
-                //     message::ParsingError::Other(_) => {
-                //         Ok(None)
-                //     }
-                // }
             },
-            // Err(_) => Ok(None),
         }
     }
 }
