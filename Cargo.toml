@@ -16,5 +16,6 @@ serde_bencode = "0.2.3"
 sha1 = "0.10.6"
 tokio = { version = "1.39.2", features = ["full"] }
 tokio-macros = "=2.4.0"
+tokio-stream = "0.1.16"
 url = "2.5.2"
 urlencoding = "2.1.3"

@@ -1,13 +1,20 @@
-use std::collections::HashMap;
+use std::borrow::BorrowMut;
+use std::collections::{HashMap, HashSet};
+use std::future::IntoFuture;
 use std::io::{self};
+use std::net::SocketAddrV4;
 use std::sync::Arc;
 
-use piece::Block;
+use bitfield::Bitfield;
+use hashes::Hashes;
+use piece::{Block, BlockData};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc::{self};
+use tokio::sync::{oneshot, Mutex};
+use tokio_stream::StreamExt;
 
 use bytes::BufMut;
 
@@ -27,13 +34,14 @@ mod peer;
 mod peers;
 mod piece;
 mod torrent;
-// mod worker;
+mod worker;
 
 use handshake::Handshake;
 use message::{Message, MessageId, BLOCK_MAX};
 use peer::PeerConnection;
 use peers::Peers;
 use torrent::{Info, Keys, Torrent};
+use worker::ThreadPool;
 
 pub fn urlencode(t: &[u8; 20]) -> String {
     let mut encoded = String::with_capacity(3 * t.len());
@@ -55,9 +63,67 @@ pub fn info_hash(info: &Info) -> [u8; 20] {
         .expect("GenericArray<_, 20> == [_; 20]")
 }
 
-async fn write_piece(file: &mut File, piece: &Block, offset: u32) -> io::Result<()> {
+pub fn piece_wrapper(b: &RequestBlock) -> Vec<u8> {
+    let piece_len = MessageId::Request.header_len();
+    let length = u32::to_be_bytes(piece_len as u32);
+    let mut buffer = vec![];
+
+    let piece_index = u32::to_be_bytes(b.piece_index as u32);
+    let offset = u32::to_be_bytes(b.offset as u32);
+    let block_length = u32::to_be_bytes(b.block_length as u32);
+
+    buffer.extend_from_slice(&length);
+    buffer.put_u8(MessageId::Request as u8);
+
+    buffer.extend_from_slice(&piece_index);
+    buffer.extend_from_slice(&offset);
+    buffer.extend_from_slice(&block_length);
+
+    buffer
+    // pc.write_frame(&buffer).await.unwrap();
+    // count += 1;
+}
+
+pub fn piece_parcer(index: usize, torrent: &Torrent) -> Vec<RequestBlock> {
+    let pieces_count = torrent.info.pieces.0.len();
+    let piece_size = if index == pieces_count - 1 {
+        let md = torrent.length() % BLOCK_MAX;
+        if md == 0 {
+            BLOCK_MAX
+        } else {
+            md
+        }
+    } else {
+        BLOCK_MAX
+    };
+
+    let blocks_count = (torrent.info.plength + (BLOCK_MAX - 1)) / BLOCK_MAX;
+
+    (0..blocks_count)
+        .map(|i| {
+            let block_size = if i == blocks_count - 1 {
+                let md = piece_size % BLOCK_MAX;
+                if md == 0 {
+                    BLOCK_MAX
+                } else {
+                    md
+                }
+            } else {
+                BLOCK_MAX
+            };
+            RequestBlock {
+                // peer,
+                piece_index: index as u32,
+                offset: i * BLOCK_MAX,
+                block_length: block_size,
+            }
+        })
+        .collect::<Vec<RequestBlock>>()
+}
+
+async fn write_piece(file: &mut File, data: &Vec<u8>, offset: u32) -> io::Result<()> {
     file.seek(SeekFrom::Start(offset as u64)).await?;
-    file.write_all(&*piece.data).await?;
+    file.write_all(data).await?;
     Ok(())
 }
 
@@ -73,11 +139,15 @@ enum PieceStatus {
     Awaiting,
     Requested,
     Downloaded,
+    Error,
 }
 
-#[derive(Debug, PartialEq)]
-struct PieceInfo {
-    status: PieceStatus,
+#[derive(Debug)]
+struct RequestBlock {
+    // peer: SocketAddrV4,
+    piece_index: u32,
+    offset: usize,
+    block_length: usize,
 }
 
 #[tokio::main]
@@ -86,27 +156,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut o = File::create("foo.txt").await?;
     let mut buffer = Vec::new();
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (test_tx, mut test_rx) = mpsc::channel(100);
 
-    let map = Arc::new(Mutex::new(HashMap::new()));
+    // let (tx, mut rx) = mpsc::unbounded_channel();
+    let (blocks_tx, mut block_rx) = mpsc::unbounded_channel::<(usize, Vec<u8>)>();
+
+    // let map = Arc::new(Mutex::new(HashMap::new()));
+    let single_map = Arc::new(Mutex::new(HashSet::new()));
+
+    let mut kkk = HashSet::new();
 
     f.read_to_end(&mut buffer).await?;
 
-    let deserialized = serde_bencode::from_bytes::<Torrent>(&buffer).unwrap();
+    let deserialized = Arc::new(serde_bencode::from_bytes::<Torrent>(&buffer).unwrap());
 
     let mut url = Url::parse(&deserialized.announce).unwrap();
 
-    map.lock()
-        .await
-        .extend((0..deserialized.info.pieces.0.len()).map(|n| {
-            (
-                n,
-                PieceInfo {
-                    status: PieceStatus::Awaiting,
-                },
-            )
-        }));
+    kkk.extend((0..deserialized.info.pieces.0.len()).map(|n| n));
 
+    single_map
+        .lock()
+        .await
+        .extend((0..deserialized.info.pieces.0.len()).map(|n| n));
 
     let mut data = [0u8; 20];
     rand::thread_rng().fill_bytes(&mut data);
@@ -151,138 +222,190 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peers_info = serde_bencode::from_bytes::<PeersInfo>(&body).unwrap();
 
-    let mut handles = Vec::new();
+    // let mut handles = Vec::new();
 
-    for peer in peers_info.peers.0.into_iter() {
-        let peer_tx = tx.clone();
-        let map_clone = Arc::clone(&map);
+    let peers = peers_info.peers.0.clone();
+    let mut stream = tokio_stream::iter(peers);
 
-        handles.push(tokio::spawn(async move {
-            let mut stream = TcpStream::connect(peer).await.unwrap();
-            let mut handshake = Handshake::new(result, data);
+    let fff = Arc::new(Mutex::new(HashMap::new()));
 
-            {
-                let handshake_bytes =
-                    &mut handshake as *mut Handshake as *mut [u8; std::mem::size_of::<Handshake>()];
-                // Safety: Handshake is a POD with repr(c) and repr(packed)
-                let handshake_bytes: &mut [u8; std::mem::size_of::<Handshake>()] =
-                    unsafe { &mut *handshake_bytes };
-                stream.write_all(handshake_bytes).await.unwrap();
-                stream.read_exact(handshake_bytes).await.unwrap();
-                println!("send handshake to {}", peer);
+    while let Some(peer) = stream.next().await {
+        let mut stream = TcpStream::connect(peer).await.unwrap();
+        let mut handshake = Handshake::new(result, data);
+
+        {
+            let handshake_bytes =
+                &mut handshake as *mut Handshake as *mut [u8; std::mem::size_of::<Handshake>()];
+            // Safety: Handshake is a POD with repr(c) and repr(packed)
+            let handshake_bytes: &mut [u8; std::mem::size_of::<Handshake>()] =
+                unsafe { &mut *handshake_bytes };
+            stream.write_all(handshake_bytes).await.unwrap();
+            stream.read_exact(handshake_bytes).await.unwrap();
+            println!("send handshake to {}", peer);
+        }
+
+        let mut pc = PeerConnection::new(stream);
+
+        while let Some(frame) = pc.read_frame().await.unwrap() {
+            if let Message::Bitfield(b) = frame {
+                // println!("{:?}", b);
+
+                if b.pieces().any(|p| kkk.contains(&p)) {
+                    fff.lock().await.insert(peer, (b, pc));
+                }
+
+                // maybe close connection or sth because peer doest have pieces to download
+
+                break;
             }
+        }
+    }
 
-            let mut pc = PeerConnection::new(stream);
+    let test_tx = Arc::new(test_tx);
 
-            loop {
-                if let Some(frame) = pc.read_frame().await.unwrap() {
-                    match frame {
-                        Message::Bitfield(b) => {
-                            let msg_len = MessageId::Interested.header_len();
-                            let mut buffer = vec![];
-                            let len_slice = u32::to_be_bytes(msg_len as u32);
+    for i in kkk.into_iter() {
+        // let res = some_computation(i).await;
+        test_tx.send(i).await.unwrap();
+    }
 
-                            buffer.extend_from_slice(&len_slice);
-                            buffer.put_u8(MessageId::Interested as u8);
+    let pool = ThreadPool::new(2);
 
-                            pc.write_frame(&buffer).await.unwrap();
-                        }
-                        Message::Choke => todo!(),
-                        Message::Unchoke => {
-                            let mut count = 0;
-                            let msg_len = MessageId::Request.header_len();
-                            let length = u32::to_be_bytes(msg_len as u32);
+    let torrent = Arc::clone(&deserialized);
 
-                            for (id, info) in map_clone.lock().await.iter_mut() {
-                                if info.status == PieceStatus::Awaiting {
-                                    let index = *id as u32;
-                                    let pieces_count = 3;
-                                    // let pieces_count = deserialized.info.pieces.0.len() as u32;
-                                    let piece_size = if index == pieces_count - 1 {
-                                        // println!("p {}", deserialized.length());
-                                        let md = 92063 % BLOCK_MAX;
-                                        if md == 0 {
-                                            BLOCK_MAX
-                                        } else {
-                                            md
-                                        }
-                                    } else {
-                                        BLOCK_MAX
-                                    };
+    tokio::spawn(async move {
+        while let Some((piece_index, data)) = block_rx.recv().await {
+            // println!("piece {:?}", piece);
+            // println!("arc count {}", Arc::strong_count(&test_tx));
+            let offset = (piece_index * torrent.info.plength) as u32;
+            write_piece(&mut o, &data, offset).await.unwrap();
+        }
+    });
 
-                                    let blocks_count = (deserialized.info.plength + (BLOCK_MAX - 1)) / BLOCK_MAX;
+    while let Some(k) = test_rx.recv().await {
+        // for k in kkk.iter() {
+        // let k = k.clone();
+        let blocks_tx_copy = blocks_tx.clone();
+        let torrent = Arc::clone(&deserialized);
+        let ff = Arc::clone(&fff);
+        let piece_queue = Arc::clone(&test_tx.clone());
+        pool.execute(move || {
+            let rt = Runtime::new().unwrap();
 
-                                    for i in 0..blocks_count {
-                                        let block_size = if i == blocks_count - 1 {
-                                            let md = piece_size % BLOCK_MAX;
-                                            if md == 0 {
-                                                BLOCK_MAX
-                                            } else {
-                                                md
-                                            }
-                                        } else {
-                                            BLOCK_MAX
-                                        };
+            rt.block_on(async {
+                let mut peers = ff.lock().await;
+                let mut peer_addr = None;
 
-                                        let mut buffer = vec![];
-                                        let piece_index = u32::to_be_bytes(index);
-                                        let offset = u32::to_be_bytes((i * BLOCK_MAX) as u32);
-                                        let block_length = u32::to_be_bytes(block_size as u32);
+                for (peer, value) in peers.iter() {
+                    if value.0.has_piece(k) {
+                        peer_addr = Some(peer.clone());
+                        break;
+                    }
+                }
 
+                let peer = if let Some(peer_addr) = peer_addr {
+                    peers.remove(&peer_addr)
+                } else {
+                    None
+                };
 
-                                        buffer.extend_from_slice(&length);
-                                        buffer.put_u8(MessageId::Request as u8);
+                drop(peers);
 
-                                        buffer.extend_from_slice(&piece_index);
-                                        buffer.extend_from_slice(&offset);
-                                        buffer.extend_from_slice(&block_length);
+                if let Some((_, mut pc)) = peer {
+                    // let (b, mut pc) = n.remove(&p).unwrap();
 
-                                        // println!(
-                                        //     "Awaiting piece: {}, block: {}, offset: {:?}, size: {}, count: {}, peer: {}",
-                                        //     index, i, i * BLOCK_MAX, block_size, count, peer
-                                        // );
+                    let msg_len = MessageId::Interested.header_len();
+                    let len_slice = u32::to_be_bytes(msg_len as u32);
+                    let mut buffer = vec![];
+                    let mut count = 5;
+                    let mut recived = 0;
+                    let pieces_count = torrent.info.pieces.0.len();
+                    let blocks = piece_parcer(k, &torrent);
+                    let piece_size: usize = if k + 1 == pieces_count {
+                        torrent.info.plength - (torrent.info.plength * pieces_count - torrent.length())
+                    } else {
+                        torrent.info.plength
+                    };
 
-                                        info.status = PieceStatus::Requested;
-                                        count += 1;
+                    let mut all_blocks = vec![0u8; piece_size];
+
+                    buffer.extend_from_slice(&len_slice);
+                    buffer.put_u8(MessageId::Interested as u8);
+
+                    pc.write_frame(&buffer).await.unwrap();
+
+                    loop {
+                        if let Some(frame) = pc.read_frame().await.unwrap() {
+                            match frame {
+                                Message::Unchoke => {
+                                    // println!("Unchoked {}", p);
+
+                                    for b in blocks.iter().take(5) {
+                                        let buffer = piece_wrapper(b);
 
                                         pc.write_frame(&buffer).await.unwrap();
                                     }
                                 }
+                                Message::Choke => {
+                                    piece_queue.send(k).await.unwrap();
+                                }
+                                Message::Piece {
+                                    piece_index,
+                                    offset,
+                                    data,
+                                } => {
+                                    // let (resp_tx, resp_rx) = oneshot::channel();
+
+                                    let block = Block {
+                                        piece_index,
+                                        offset,
+                                        data,
+                                    };
+
+                                    recived += 1;
+
+                                    println!("get piece index: {} offset: {}", piece_index, offset);
+
+                                    all_blocks[block.offset as usize..][..block.data.len()].copy_from_slice(&block.data);
+
+                                    if count < blocks.len() {
+                                        count += 1;
+                                        let buffer = piece_wrapper(&blocks[count]);
+
+                                        pc.write_frame(&buffer).await.unwrap();
+                                    }
+
+                                    // blocks_tx_copy.send((block, resp_tx)).unwrap();
+
+                                    if recived == blocks.len() {
+                                        // println!("length: {}", all_blocks.len());
+                                        let mut hasher = Sha1::new();
+                                        hasher.update(&all_blocks);
+                                        let hash: [u8; 20] = hasher
+                                            .finalize()
+                                            .try_into()
+                                            .expect("GenericArray<_, 20> == [_; 20]");
+
+                                        let is_equal = hash.iter()
+                                        .zip(torrent.info.pieces.0[k].iter())
+                                        .all(|(&a, &b)| a == b );
+
+                                        if is_equal {
+                                            blocks_tx_copy.send((k, all_blocks)).unwrap();
+                                            println!("great success!");
+                                        } else {
+                                            piece_queue.send(k).await.unwrap();
+                                        }
+
+                                        break;
+                                    }
+                                }
+                                _ => todo!(),
                             }
                         }
-                        Message::Interested => {}
-                        Message::NotInterested => todo!(),
-                        Message::Have { piece_index } => todo!(),
-                        Message::Request(_) => todo!(),
-                        Message::Piece {
-                            piece_index,
-                            offset,
-                            data,
-                        } => {
-                            let block = Block {
-                                piece_index,
-                                offset,
-                                data,
-                            };
-
-                            // println!("get piece index: {} offset: {}", piece_index, offset);
-                            peer_tx.send(block).unwrap();
-                        }
-                        Message::Cancel(_) => todo!(),
                     }
                 }
-            }
-        }));
-    }
-
-    while let Some(piece) = rx.recv().await {
-        let offset = (piece.piece_index * deserialized.info.plength) as u32 + piece.offset;
-        // println!("index: {}, offset: {}", piece.piece_index, offset);
-        write_piece(&mut o, &piece, offset).await.unwrap();
-    }
-
-    for handle in handles {
-        handle.await.unwrap();
+            })
+        });
     }
 
     Ok(())
