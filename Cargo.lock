@@ -98,6 +98,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_bencode",
+ "serde_json",
  "sha1",
  "tokio",
  "tokio-macros",

@@ -1,6 +1,35 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
+use serde_bencode::error::Error;
+
 use crate::hashes::Hashes;
+
+#[derive(Debug)]
+// #[non_exhaustive]
+pub enum TorrentError {
+    ParseError,
+}
+
+impl From<Error> for TorrentError {
+    fn from(_: Error) -> Self {
+        // the pieces field is a concatenation of 20 byte SHA-1 hashes, so it
+        // must be a multiple of 20
+        Self::ParseError
+    }
+}
+
+impl fmt::Display for TorrentError {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use TorrentError::*;
+        match self {
+            ParseError => {
+                write!(fmt, "cant parse torrent file")
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Torrent {

@@ -8,12 +8,12 @@ use std::sync::Arc;
 use bitfield::Bitfield;
 use hashes::Hashes;
 use piece::{Block, BlockData};
-use tokio::fs::File;
+use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio_stream::StreamExt;
 
 use bytes::BufMut;
@@ -35,6 +35,7 @@ mod peers;
 mod piece;
 mod torrent;
 mod worker;
+mod download;
 
 use handshake::Handshake;
 use message::{Message, MessageId, BLOCK_MAX};
@@ -42,6 +43,7 @@ use peer::PeerConnection;
 use peers::Peers;
 use torrent::{Info, Keys, Torrent};
 use worker::ThreadPool;
+use download::DownloadState;
 
 pub fn urlencode(t: &[u8; 20]) -> String {
     let mut encoded = String::with_capacity(3 * t.len());
@@ -153,8 +155,8 @@ struct RequestBlock {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut f = File::open("sample.torrent").await?;
-    let mut o = File::create("foo.txt").await?;
     let mut buffer = Vec::new();
+    let state = DownloadState::load().await;
 
     let (test_tx, mut test_rx) = mpsc::channel(100);
 
@@ -168,11 +170,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     f.read_to_end(&mut buffer).await?;
 
-    let deserialized = Arc::new(serde_bencode::from_bytes::<Torrent>(&buffer).unwrap());
+    let deserialized = Arc::new(serde_bencode::from_bytes::<Torrent>(&buffer)?);
+
+    let mut output_f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&deserialized.info.name)
+        .await?;
 
     let mut url = Url::parse(&deserialized.announce).unwrap();
 
-    kkk.extend((0..deserialized.info.pieces.0.len()).map(|n| n));
+    let state = if let Ok(state) = state {
+        state
+    } else {
+        DownloadState::new(&deserialized.info.name, deserialized.info.pieces.0.len())
+    };
+
+    kkk.extend(state.get_missed_parts());
+
+    // kkk.extend((0..deserialized.info.pieces.0.len()).map(|n| n));
+
+    let state = RwLock::new(state);
 
     single_map
         .lock()
@@ -277,7 +296,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // println!("piece {:?}", piece);
             // println!("arc count {}", Arc::strong_count(&test_tx));
             let offset = (piece_index * torrent.info.plength) as u32;
-            write_piece(&mut o, &data, offset).await.unwrap();
+
+            match write_piece(&mut output_f, &data, offset).await {
+                Ok(_) => {
+                    let mut n = state.write().await;
+
+                    n.update(piece_index).await.unwrap();
+                },
+                Err(_) => todo!(),
+            };
         }
     });
 
