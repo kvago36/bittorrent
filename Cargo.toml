@@ -8,7 +8,10 @@ async-channel = "2.3.1"
 bendy = { version = "^0.3", features = ["std", "serde"] }
 bytes = "1.7.1"
 crossbeam = "0.8.4"
+env_logger = "0.11.5"
 hex = "0.4.3"
+log = "0.4.22"
+num_cpus = "1.16.0"
 rand = "0.8.5"
 reqwest = "0.12.5"
 serde = { version = "1.0", features = ["derive"] }

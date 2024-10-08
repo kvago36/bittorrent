@@ -1,5 +1,7 @@
+use std::fmt;
+
 use bytes::Buf;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, ErrorKind};
 
 use crate::{
     bitfield::Bitfield,
@@ -11,9 +13,34 @@ pub enum ParsingError {
     /// Not enough data is available to parse a message
     Incomplete(usize),
 
+    /// Error while parsing
+    ParsingError,
+
     /// Invalid message encoding
     Other(std::io::Error),
 }
+
+// Implement `Display` trait for custom error messages
+impl fmt::Display for ParsingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParsingError::Incomplete(n) => write!(f, "The message hasn't arrived yet; waiting for more bytes. {}", n),
+            ParsingError::ParsingError => write!(f, "Unexpected end of file encountered."),
+            ParsingError::Other(e) => write!(f, "Error while parcing: {}", e),
+        }
+    }
+}
+
+impl From<std::io::Error> for ParsingError {
+    fn from(err: std::io::Error) -> Self {
+        if err.kind() == ErrorKind::UnexpectedEof {
+            ParsingError::ParsingError
+        } else {
+            ParsingError::Other(err)
+        }
+    }
+}
+
 
 /// The actual messages exchanged by peers.
 #[derive(Debug, PartialEq)]
@@ -134,7 +161,7 @@ impl Message {
                 let mut data = Vec::new();
 
                 // read the whole file
-                src.read_to_end(&mut data).unwrap();
+                src.read_to_end(&mut data)?;
 
                 let bitfield = Bitfield::from_payload(data);
                 Message::Bitfield(bitfield)
@@ -144,7 +171,7 @@ impl Message {
                 let offset = src.get_u32();
 
                 let mut foo = vec![0; length - 4 - 4 - 1];
-                src.read_exact(&mut foo).unwrap();
+                src.read_exact(&mut foo)?;
 
                 // println!("length: {} data: {}, len: {}", length, foo.len(), src.get_ref().len());
 

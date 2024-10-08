@@ -1,23 +1,18 @@
-use std::borrow::BorrowMut;
 use std::collections::{HashMap, HashSet};
-use std::future::IntoFuture;
-use std::io::{self};
-use std::net::SocketAddrV4;
 use std::sync::Arc;
 
-use bitfield::Bitfield;
-use hashes::Hashes;
 use piece::{Block, BlockData};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self};
 use tokio::sync::{oneshot, Mutex, RwLock};
-use tokio_stream::StreamExt;
+use tokio::time::{self, Duration};
 
 use bytes::BufMut;
 
+use log::{error, info, warn};
 use rand::prelude::*;
 use sha1::{Digest, Sha1};
 use url::Url;
@@ -27,6 +22,7 @@ use serde::Deserialize;
 use serde_bencode;
 
 mod bitfield;
+mod download;
 mod handshake;
 mod hashes;
 mod message;
@@ -35,15 +31,16 @@ mod peers;
 mod piece;
 mod torrent;
 mod worker;
-mod download;
+mod foo;
 
+use foo::Foo;
+use download::DownloadState;
 use handshake::Handshake;
 use message::{Message, MessageId, BLOCK_MAX};
 use peer::PeerConnection;
 use peers::Peers;
 use torrent::{Info, Keys, Torrent};
 use worker::ThreadPool;
-use download::DownloadState;
 
 pub fn urlencode(t: &[u8; 20]) -> String {
     let mut encoded = String::with_capacity(3 * t.len());
@@ -136,14 +133,6 @@ struct PeersInfo {
     interval: usize,
 }
 
-#[derive(PartialEq, Debug)]
-enum PieceStatus {
-    Awaiting,
-    Requested,
-    Downloaded,
-    Error,
-}
-
 #[derive(Debug)]
 struct RequestBlock {
     // peer: SocketAddrV4,
@@ -154,19 +143,19 @@ struct RequestBlock {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut f = File::open("sample.torrent").await?;
+    env_logger::init();
+
+    let num = num_cpus::get();
+    let mut f = File::open("debian.torrent").await?;
     let mut buffer = Vec::new();
     let state = DownloadState::load().await;
 
+
     let (test_tx, mut test_rx) = mpsc::channel(100);
 
-    // let (tx, mut rx) = mpsc::unbounded_channel();
     let (blocks_tx, mut block_rx) = mpsc::unbounded_channel::<(usize, Vec<u8>)>();
 
-    // let map = Arc::new(Mutex::new(HashMap::new()));
     let single_map = Arc::new(Mutex::new(HashSet::new()));
-
-    let mut kkk = HashSet::new();
 
     f.read_to_end(&mut buffer).await?;
 
@@ -187,9 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DownloadState::new(&deserialized.info.name, deserialized.info.pieces.0.len())
     };
 
-    kkk.extend(state.get_missed_parts());
-
-    // kkk.extend((0..deserialized.info.pieces.0.len()).map(|n| n));
+    let kkk: Arc<HashSet<usize>> = Arc::new(HashSet::from_iter(state.get_missed_parts().iter().cloned().collect::<Vec<_>>()));
 
     let state = RwLock::new(state);
 
@@ -209,13 +196,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = info_hash(&deserialized.info);
     let urlencoded = urlencode(&result);
-
-    // println!(
-    //     "pieces_len: {:?}, psize: {:?} length: {:?}",
-    //     deserialized.info.pieces.0.len(),
-    //     deserialized.info.plength,
-    //     deserialized.info.keys
-    // );
 
     let coded = encode_binary(&data);
 
@@ -241,60 +221,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peers_info = serde_bencode::from_bytes::<PeersInfo>(&body).unwrap();
 
-    // let mut handles = Vec::new();
+    let fff = Arc::new(RwLock::new(HashMap::new()));
 
-    let peers = peers_info.peers.0.clone();
-    let mut stream = tokio_stream::iter(peers);
+    let mut join_handles = vec![];
 
-    let fff = Arc::new(Mutex::new(HashMap::new()));
+    for peer in peers_info.peers.0 {
+        let ba = Arc::clone(&kkk);
+        let bitfield_map = Arc::clone(&fff);
+        join_handles.push(tokio::spawn(async move {
+            let timeout_duration = Duration::from_secs(2);
 
-    while let Some(peer) = stream.next().await {
-        let mut stream = TcpStream::connect(peer).await.unwrap();
-        let mut handshake = Handshake::new(result, data);
+            match time::timeout(timeout_duration, TcpStream::connect(peer)).await {
+                Ok(Ok(mut stream)) => {
+                    let mut handshake = Handshake::new(result, data);
 
-        {
-            let handshake_bytes =
-                &mut handshake as *mut Handshake as *mut [u8; std::mem::size_of::<Handshake>()];
-            // Safety: Handshake is a POD with repr(c) and repr(packed)
-            let handshake_bytes: &mut [u8; std::mem::size_of::<Handshake>()] =
-                unsafe { &mut *handshake_bytes };
-            stream.write_all(handshake_bytes).await.unwrap();
-            stream.read_exact(handshake_bytes).await.unwrap();
-            println!("send handshake to {}", peer);
-        }
+                    let result: io::Result<()> = async {
+                        let handshake_bytes = &mut handshake as *mut Handshake as *mut [u8; std::mem::size_of::<Handshake>()];
+                        // Safety: Handshake is a POD with repr(c) and repr(packed)
+                        let handshake_bytes: &mut [u8; std::mem::size_of::<Handshake>()] =
+                            unsafe { &mut *handshake_bytes };
+                        stream.write_all(handshake_bytes).await?;
+                        stream.read_exact(handshake_bytes).await?;
+                        Ok(())
+                    }.await;
+        
+                    if let Ok(_) = result {
+                        let mut pc = PeerConnection::new(stream);
+        
+                        tokio::select! {
+                            Ok(Some(frame)) = pc.read_frame() => {
+                                match frame {
+                                    Message::Bitfield(bitfield) => {
+                                        info!("{} send bitfield", peer);
+                                        if bitfield.pieces().any(|p| ba.contains(&p)) {
+                                            bitfield_map.write().await.insert(peer, (bitfield, pc));
+                                        }
+                                    },
+                                    _ => {
+                                        warn!("Peer didnt sent bitfield msg")
+                                    }
+                                }
+                            }
+                            _ = time::sleep(Duration::from_millis(600)) => {
+                                warn!("timeout for bitfield msg")
+                            }
+                        }
+                    } else {
+                        error!("Error during handshake check")
 
-        let mut pc = PeerConnection::new(stream);
-
-        while let Some(frame) = pc.read_frame().await.unwrap() {
-            if let Message::Bitfield(b) = frame {
-                // println!("{:?}", b);
-
-                if b.pieces().any(|p| kkk.contains(&p)) {
-                    fff.lock().await.insert(peer, (b, pc));
+                    }
                 }
-
-                // maybe close connection or sth because peer doest have pieces to download
-
-                break;
+                Ok(Err(e)) => {
+                    error!("Failed to connect: {:?}", e);
+                }
+                Err(_) => {
+                    info!("Connection attempt timed out after {:?} seconds", timeout_duration);
+                }
             }
-        }
+        }));
     }
 
     let test_tx = Arc::new(test_tx);
-
-    for i in kkk.into_iter() {
-        // let res = some_computation(i).await;
-        test_tx.send(i).await.unwrap();
-    }
-
-    let pool = ThreadPool::new(2);
-
+    let pool = ThreadPool::new(num);
     let torrent = Arc::clone(&deserialized);
 
     tokio::spawn(async move {
         while let Some((piece_index, data)) = block_rx.recv().await {
-            // println!("piece {:?}", piece);
-            // println!("arc count {}", Arc::strong_count(&test_tx));
             let offset = (piece_index * torrent.info.plength) as u32;
 
             match write_piece(&mut output_f, &data, offset).await {
@@ -302,24 +294,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut n = state.write().await;
 
                     n.update(piece_index).await.unwrap();
-                },
+                }
                 Err(_) => todo!(),
             };
         }
     });
 
+    info!("waiting for tasks finish");
+
+    for join_handle in join_handles.drain(..) {
+        join_handle.await.unwrap();
+    }
+
+    info!("starting queue");
+    let test_t = Arc::clone(&test_tx);
+
+    tokio::spawn(async move {
+        if let Ok(kkk) = Arc::try_unwrap(kkk) {
+            info!("tasks to download: {:?}", kkk.len());
+            for i in kkk.into_iter() {
+                test_t.send(i).await.unwrap();
+            }
+        } else {
+            error!("cant unwrap tasks");
+        }
+    });
+
     while let Some(k) = test_rx.recv().await {
-        // for k in kkk.iter() {
-        // let k = k.clone();
         let blocks_tx_copy = blocks_tx.clone();
         let torrent = Arc::clone(&deserialized);
         let ff = Arc::clone(&fff);
-        let piece_queue = Arc::clone(&test_tx.clone());
+        let piece_queue = Arc::clone(&test_tx);
+
+        if let None = fff.read().await.values().find(|(b, _)| b.has_piece(k)) {
+            info!("no have peers for piece {}", k);
+            continue;
+        }
+
         pool.execute(move || {
+            info!("recived {} task", k);
+
             let rt = Runtime::new().unwrap();
 
             rt.block_on(async {
-                let mut peers = ff.lock().await;
+                let mut peers = ff.write().await;
                 let mut peer_addr = None;
 
                 for (peer, value) in peers.iter() {
@@ -337,18 +355,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 drop(peers);
 
-                if let Some((_, mut pc)) = peer {
-                    // let (b, mut pc) = n.remove(&p).unwrap();
-
+                if let Some((bitfield, mut pc)) = peer {
                     let msg_len = MessageId::Interested.header_len();
                     let len_slice = u32::to_be_bytes(msg_len as u32);
                     let mut buffer = vec![];
                     let mut count = 5;
                     let mut recived = 0;
+                    let mut is_finished = false;
                     let pieces_count = torrent.info.pieces.0.len();
                     let blocks = piece_parcer(k, &torrent);
                     let piece_size: usize = if k + 1 == pieces_count {
-                        torrent.info.plength - (torrent.info.plength * pieces_count - torrent.length())
+                        torrent.info.plength
+                            - (torrent.info.plength * pieces_count - torrent.length())
                     } else {
                         torrent.info.plength
                     };
@@ -364,8 +382,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(frame) = pc.read_frame().await.unwrap() {
                             match frame {
                                 Message::Unchoke => {
-                                    // println!("Unchoked {}", p);
-
                                     for b in blocks.iter().take(5) {
                                         let buffer = piece_wrapper(b);
 
@@ -374,14 +390,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 Message::Choke => {
                                     piece_queue.send(k).await.unwrap();
+                                    break;
                                 }
                                 Message::Piece {
                                     piece_index,
                                     offset,
                                     data,
                                 } => {
-                                    // let (resp_tx, resp_rx) = oneshot::channel();
-
                                     let block = Block {
                                         piece_index,
                                         offset,
@@ -390,21 +405,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                     recived += 1;
 
-                                    println!("get piece index: {} offset: {}", piece_index, offset);
+                                    // info!("get piece index: {} offset: {}", piece_index, offset);
 
-                                    all_blocks[block.offset as usize..][..block.data.len()].copy_from_slice(&block.data);
+                                    all_blocks[block.offset as usize..][..block.data.len()]
+                                        .copy_from_slice(&block.data);
 
                                     if count < blocks.len() {
                                         count += 1;
-                                        let buffer = piece_wrapper(&blocks[count]);
+                                        let buffer = piece_wrapper(&blocks[count - 1]);
 
                                         pc.write_frame(&buffer).await.unwrap();
                                     }
 
-                                    // blocks_tx_copy.send((block, resp_tx)).unwrap();
-
                                     if recived == blocks.len() {
-                                        // println!("length: {}", all_blocks.len());
                                         let mut hasher = Sha1::new();
                                         hasher.update(&all_blocks);
                                         let hash: [u8; 20] = hasher
@@ -412,15 +425,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             .try_into()
                                             .expect("GenericArray<_, 20> == [_; 20]");
 
-                                        let is_equal = hash.iter()
-                                        .zip(torrent.info.pieces.0[k].iter())
-                                        .all(|(&a, &b)| a == b );
+                                        let is_equal = hash
+                                            .iter()
+                                            .zip(torrent.info.pieces.0[k].iter())
+                                            .all(|(&a, &b)| a == b);
 
                                         if is_equal {
                                             blocks_tx_copy.send((k, all_blocks)).unwrap();
-                                            println!("great success!");
+                                            info!("great success!");
                                         } else {
+                                            error!("piece hash isnt equal!");
                                             piece_queue.send(k).await.unwrap();
+                                            is_finished = true;
                                         }
 
                                         break;
@@ -430,6 +446,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+
+                    if is_finished {
+                        ff.write().await.insert(peer_addr.unwrap(), (bitfield, pc));
+                    }
+                } else {
+                    info!("all peers are buzy now sending piece: {} back to queue", k);
+                    piece_queue.send(k).await.unwrap();
                 }
             })
         });
