@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddrV4;
 use std::sync::Arc;
-use std::fmt;
 
 use rand::prelude::*;
 use sha1::{Digest, Sha1};
@@ -12,8 +11,7 @@ use bytes::BufMut;
 
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{RwLock, Mutex};
 use tokio::sync::oneshot::{self, Sender};
 use tokio::time::{self, Duration};
@@ -24,14 +22,11 @@ use serde::Deserialize;
 
 use thiserror::Error;
 
-use rand::prelude::*;
-
 use crate::bitfield::Bitfield;
 use crate::message::{Message, MessageId, BLOCK_MAX};
 use crate::peer::PeerConnection;
 use crate::peers::Peers;
-use crate::piece::{self, Block};
-use crate::worker::ThreadPool;
+use crate::piece::Block;
 use crate::{
     download::DownloadState,
     handshake::Handshake,
@@ -94,18 +89,6 @@ pub fn piece_parcer(index: usize, torrent_length: usize, pieces_count: usize, pl
 
 #[derive(Debug, Error)]
 pub enum FooError {
-    // /// Error while connection to a peer
-    // ConnectionError,
-
-    // /// Error while parsing
-    // HashError,
-
-    // /// Error while writting to the file
-    // WritingError,
-
-    // /// Invalid message encoding
-    // Other(std::io::Error),
-
     #[error("Error! Invalid hash!")]
     InvalidHash,
 
@@ -122,36 +105,10 @@ pub enum FooError {
     Disconnect(#[from] io::Error),
 }
 
-
-// impl fmt::Display for FooError {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         match self {
-//             FooError::HashError => write!(f, "Error! Incorrect Hash!"),
-//             FooError::ConnectionError => write!(f, "Error! Peer close connection"),
-//             FooError::WritingError => write!(f, "Error! Cant writting to the file"),
-//             FooError::Other(e) => write!(f, "Error {} while downloading piece", e),
-//         }
-//     }
-// }
-
-// impl From<std::io::Error> for FooError {
-//     fn from(err: std::io::Error) -> Self {
-//         if err.kind() == ErrorKind::UnexpectedEof {
-//             FooError::ConnectionError
-//         } else {
-//             FooError::Other(err)
-//         }
-//     }
-// }
-
-// impl std::error::Error for FooError {}
-
 #[derive(Debug)]
 enum PeerState {
     Connected,
     Bitfield(Bitfield),
-    /// block size
-    // Downloading(usize),
     /// count, received, requested
     Download(usize, usize, usize),
     Interested,
@@ -200,7 +157,6 @@ pub struct Foo {
     connections: Arc<RwLock<HashMap<SocketAddrV4, (Bitfield, PeerConnection)>>>,
     peers_info: Option<PeersInfo>,
     sender: UnboundedSender<Piece>,
-    // r: UnboundedReceiver<SocketAddrV4>,
 }
 
 impl Foo {
@@ -228,7 +184,6 @@ impl Foo {
             peer_id: data,
             info_hash,
             sender,
-            // r,
         }
     }
     pub async fn tete(&self) {
@@ -327,9 +282,6 @@ impl Foo {
         let body = reqwest::get(url).await.unwrap().bytes().await.unwrap();
 
         serde_bencode::from_bytes::<PeersInfo>(&body)
-        // if let Ok(peers_info) = serde_bencode::from_bytes::<PeersInfo>(&body) {
-        //     self.peers_info = Some(peers_info);
-        // }
     }
     pub async fn blabla(&self, mut r: UnboundedReceiver<SocketAddrV4>, state: HashSet<usize>) {
         let mut join_handles = vec![];
@@ -349,8 +301,6 @@ impl Foo {
 
             join_handles.push(tokio::spawn(async move {
                 let mut count = 0;
-                // let mut rng = rand::thread_rng();
-                // let y: f64 = rng.gen(); // generates a float between 0 and 1
 
                 'outer: loop {
                     count += 1;
@@ -370,37 +320,20 @@ impl Foo {
 
                     let mut pc = PeerConnection::new(stream);
                     let mut peer_state = PeerState::Connected;
-                    // let mut piece = None;
-                    // let mut b = None;
 
                     let mut blocks = Vec::with_capacity(pieces_count);
                     let mut piece_size = 0;
                     let mut all_blocks = Vec::new();
                     let mut pindex = None;
 
-                    // let (ff, gg) = mpsc::unbounded_channel();
-                    // let (dd, kk) = oneshot::channel();
-
-                    // if let Some(frame) = pc.read_frame().await.unwrap() {
-                    //     if let Message::Bitfield(b) = frame {
-                    //         response.send((b, ff)).unwrap();
-                    //     }
-                    // }
-
-                    // let (ds, sd) = oneshot::channel::<>();
-
                     let mut available_pieces = vec![];
 
                     let result: Result<(), FooError> = async { loop {
-                        // info!("{:?}", peer_state);
-
                         match peer_state {
                             PeerState::Connected => (),
                             PeerState::Bitfield(bitfield) => {
                                 let n = bbb.read().await;
 
-                                // let set2: HashSet<_> = bitfield.pieces().into_iter().collect();
-                                // bitfield
                                 let intersection: Vec<_> = bitfield.pieces()
                                     // .iter()
                                     .filter(|x| n.contains(x))
@@ -581,14 +514,6 @@ impl Foo {
                             count += 1;
                             continue 'outer;
                         },
-                        // Err(e) => {
-                            
-                        //     // if let Some(piece) = piece {
-                        //     //     bbb.lock().await.insert(piece);
-                        //     // }
-                        //     error!("{}", e);
-                        //     break 'outer;
-                        // },
                     }
                 }
             }));
@@ -596,193 +521,6 @@ impl Foo {
 
         for join_handle in join_handles.drain(..) {
             join_handle.await.unwrap();
-        }
-    }
-    pub async fn download(&mut self) {
-        let pool = ThreadPool::new(6);
-        let plength = self.torrent.info.plength;
-        let pieces_count = self.torrent.info.pieces.0.len();
-        let torrent_length = self.torrent.length();
-        let pieces = Arc::clone(&self.pieces);
-
-        let (queue_tx, mut queue_rx) = mpsc::channel(100);
-
-        let queue_tx_clone = queue_tx.clone();
-
-        tokio::spawn(async move {
-            for i in pieces.iter() {
-                queue_tx_clone.send(*i).await.unwrap();
-            }
-        });
-
-        while let Some(k) = queue_rx.recv().await {
-            let ff = Arc::clone(&self.connections);
-    
-            let state = Arc::clone(&self.state);
-
-            if let None = ff.read().await.values().find(|(b, _)| b.has_piece(k)) {
-                info!("no have peers for piece {}", k);
-                continue;
-            }
-    
-            let piecies = self.torrent.info.pieces.0.clone();
-            let pieces_queue = self.sender.clone();
-            let queue_tx = queue_tx.clone();
-
-            pool.execute(move || {
-                info!("recived {} task", k);
-    
-                let rt = Runtime::new().unwrap();
-    
-                rt.block_on(async {
-                    let mut peers = ff.write().await;
-                    let mut peer_addr = None;
-    
-                    for (peer, value) in peers.iter() {
-                        if value.0.has_piece(k) {
-                            peer_addr = Some(peer.clone());
-                            break;
-                        }
-                    }
-    
-                    let peer = if let Some(peer_addr) = peer_addr {
-                        peers.remove(&peer_addr)
-                    } else {
-                        None
-                    };
-    
-                    drop(peers);
-    
-                    if let Some((bitfield, mut pc)) = peer {
-                        let msg_len = MessageId::Interested.header_len();
-                        let len_slice = u32::to_be_bytes(msg_len as u32);
-                        let mut buffer = vec![];
-                        
-                        let mut count = 5;
-                        let mut recived = 0;
-                        let blocks = piece_parcer(k, torrent_length, pieces_count, plength);
-                        let piece_size = if k + 1 == pieces_count {
-                            plength
-                                - (plength * pieces_count - torrent_length)
-                        } else {
-                            plength
-                        };
-    
-                        let mut all_blocks = vec![0u8; piece_size];
-    
-                        buffer.extend_from_slice(&len_slice);
-                        buffer.put_u8(MessageId::Interested as u8);
-    
-                        pc.write_frame(&buffer).await.unwrap();
-    
-                        let result: Result<(), FooError> = async { loop {
-                            if let Some(frame) = pc.read_frame().await? {
-                                match frame {
-                                    Message::Unchoke => {
-                                        for b in blocks.iter().take(5) {
-                                            let buffer = piece_wrapper(b);
-    
-                                            pc.write_frame(&buffer).await?;
-                                        }
-                                    }
-                                    Message::Choke => {
-                                        queue_tx.send(k).await.unwrap();
-
-                                        break Err(FooError::Choke);
-                                    }
-                                    Message::Piece {
-                                        piece_index,
-                                        offset,
-                                        data,
-                                    } => {
-                                        let block = Block {
-                                            piece_index,
-                                            offset,
-                                            data,
-                                        };
-    
-                                        recived += 1;
-        
-                                        all_blocks[block.offset as usize..][..block.data.len()]
-                                            .copy_from_slice(&block.data);
-    
-                                        if count < blocks.len() {
-                                            count += 1;
-                                            let buffer = piece_wrapper(&blocks[count - 1]);
-    
-                                            pc.write_frame(&buffer).await?;
-                                        }
-    
-                                        if recived == blocks.len() {
-                                            let mut hasher = Sha1::new();
-                                            hasher.update(&all_blocks);
-                                            let hash: [u8; 20] = hasher
-                                                .finalize()
-                                                .try_into()
-                                                .expect("GenericArray<_, 20> == [_; 20]");
-    
-                                            let is_equal = hash
-                                                .iter()
-                                                .zip(piecies[k].iter())
-                                                .all(|(&a, &b)| a == b);
-    
-                                            if is_equal {
-                                                let (tx, rx) = oneshot::channel::<Option<usize>>();
-
-                                                pieces_queue.send(
-                                                    Piece {
-                                                        piece_index: k, 
-                                                        response: tx,
-                                                        data: all_blocks
-                                                    }
-                                                ).unwrap();
-
-                                                if let Ok(response) = rx.await {
-                                                    if let Some(_) = response {
-                                                        // is_finished = true;
-                                                        info!("great success!");
-                                                        break Ok(());
-                                                    }
-                                                }
-
-                                                break Err(FooError::Unknown);
-                                            }
-
-                                            break Err(FooError::InvalidHash);
-    
-                                            // is_finished = true;
-                                            // queue_tx.send(k).await.unwrap();
-                                            // break;
-                                        }
-                                    }
-                                    _ => todo!(),
-                                }
-                            }
-                        }}.await;
-    
-                        match result {
-                            Ok(_) => {
-                                state.lock().await.update(k).await.unwrap();
-                                ff.write().await.insert(peer_addr.unwrap(), (bitfield, pc));
-                            },
-                            Err(FooError::Empty) | Err(FooError::Choke) => {
-                                queue_tx.send(k).await.unwrap();
-                            },
-                            Err(FooError::InvalidHash) | Err(FooError::Unknown) => {
-                                // TODO: try again
-                                queue_tx.send(k).await.unwrap();
-                            },
-                            Err(FooError::Disconnect(e)) => {
-                                // TODO: remove peer from pull
-                                queue_tx.send(k).await.unwrap();
-                            },
-                        }
-                    } else {
-                        info!("all peers are buzy now sending piece: {} back to queue", k);
-                        queue_tx.send(k).await.unwrap();
-                    }
-                })
-            });
         }
     }
     fn urlencode(t: &[u8; 20]) -> String {
