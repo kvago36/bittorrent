@@ -5,6 +5,7 @@
 // use hashes::Hashes;
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct Handshake {
   length: u8,
   pstr: [u8; 19],
