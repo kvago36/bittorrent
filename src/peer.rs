@@ -6,12 +6,14 @@ use tokio::{
 
 use std::io::Cursor;
 
-use crate::message::{Message, ParsingError};
+use crate::{bitfield::{self, Bitfield}, message::{Message, ParsingError}};
 
 #[derive(Debug)]
 pub struct PeerConnection {
     stream: BufWriter<TcpStream>,
     buffer: BytesMut,
+    choked: bool,
+    bitfield: Option<Bitfield>,
 }
 
 impl PeerConnection {
@@ -19,6 +21,8 @@ impl PeerConnection {
         PeerConnection {
             stream: BufWriter::new(stream),
             buffer: BytesMut::with_capacity(4 * 1024),
+            bitfield: None,
+            choked: false
         }
     }
 
@@ -57,6 +61,14 @@ impl PeerConnection {
         self.stream.flush().await?;
 
         Ok(())
+    }
+
+    pub fn set_bitfield(&mut self, bitfield: Bitfield) {
+        self.bitfield = Some(bitfield)
+    }
+
+    pub fn get_bitfield(&self) -> Option<&Bitfield> {
+        self.bitfield.as_ref()
     }
 
     fn parse_frame(&mut self) -> Result<Option<Message>> {
